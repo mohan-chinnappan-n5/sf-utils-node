@@ -5,6 +5,7 @@ const readline = require('readline');
 const { createObjectCsvWriter } = require('csv-writer');
 const axios = require('axios');
 const fs = require('fs').promises;
+const chalk = require('chalk');
 
 const execPromise = util.promisify(exec);
 
@@ -15,12 +16,12 @@ const rl = readline.createInterface({
 
 function promptUser(question) {
     return new Promise((resolve) => {
-        rl.question(question, (answer) => {
+        rl.question(chalk.green(question), (answer) => {
             resolve(answer);
         });
     });
 }
-
+// Function to get Salesforce credentials using SFDX CLI
 async function getSalesforceCredentials(username) {
     try {
         const { stdout } = await execPromise(`sf org display -u ${username} --json`);
@@ -29,11 +30,12 @@ async function getSalesforceCredentials(username) {
         const instanceUrl = result.result.instanceUrl;
         return { accessToken, instanceUrl };
     } catch (error) {
-        console.error('Error retrieving Salesforce credentials:', error.message);
+        console.error(chalk.red('Error retrieving Salesforce credentials:', error.message));
         throw error;
     }
 }
 
+// Function to initialize jsforce connection
 async function initializeConnection(accessToken, instanceUrl) {
     const conn = new jsforce.Connection({
         instanceUrl: instanceUrl,
@@ -42,121 +44,243 @@ async function initializeConnection(accessToken, instanceUrl) {
     return conn;
 }
 
+// Function to run SOQL query
+
+
 async function runSOQLQuery(conn) {
     const query = await promptUser('Enter your SOQL query (e.g., SELECT Id, Name FROM Account LIMIT 10): ');
     try {
-        const result = await conn.query(query);
-        console.log('\n=== Query Results (JSON) ===');
-        console.log(JSON.stringify(result.records, null, 2));
+        let result = await conn.query(query);
+        let allRecords = result.records || [];
+
+        while (!result.done && result.nextRecordsUrl) {
+            console.log(chalk.yellow(`Fetching more records... (${allRecords.length} of ${result.totalSize} retrieved)`));
+            result = await conn.queryMore(result.nextRecordsUrl);
+            allRecords = allRecords.concat(result.records || []);
+        }
+
+        console.log(chalk.blue('\n=== Query Results (JSON) ==='));
+        console.log(JSON.stringify(allRecords, null, 2));
 
         const outputFormat = await promptUser('Export to CSV? (yes/no): ');
         if (outputFormat.toLowerCase() === 'yes') {
+            // Exclude 'attributes' field from CSV headers
+            const headers = Object.keys(allRecords[0] || {})
+                .filter(key => key !== 'attributes')
+                .map(key => ({ id: key, title: key }));
+
             const csvWriter = createObjectCsvWriter({
                 path: 'query_results.csv',
-                header: Object.keys(result.records[0] || {}).map(key => ({ id: key, title: key }))
+                header: headers
             });
-            await csvWriter.writeRecords(result.records);
-            console.log('Results exported to query_results.csv');
+
+            // Optionally, you can remove 'attributes' from records, but csv-writer will only use the fields in the header
+            await csvWriter.writeRecords(allRecords);
+            console.log(chalk.magenta('Results exported to query_results.csv'));
         }
     } catch (error) {
-        console.error('Error executing SOQL query:', error.message);
+        console.error(chalk.red('Error executing SOQL query:', error.message));
     }
 }
 
+// Function to run anonymous Apex code
 async function runApex(conn) {
     const apexCode = await promptUser('Enter your anonymous Apex code (end with Ctrl+D on a new line):\n');
     try {
         const result = await conn.tooling.executeAnonymous(apexCode);
-        console.log('\n=== Apex Execution Result (JSON) ===');
+        console.log(chalk.blue('\n=== Apex Execution Result (JSON) ==='));
         console.log(JSON.stringify(result, null, 2));
     } catch (error) {
-        console.error('Error executing Apex:', error.message);
+        console.error(chalk.red('Error executing Apex:', error.message));
     }
 }
 
+// Function to call a custom REST API URL
 async function callRestApi(conn) {
     const relativeUrl = await promptUser('Enter the REST API URL (e.g., /services/data/v59.0/sobjects/Account/describe): ');
     try {
-        const response = await axios.get(`${conn.instanceUrl}${relativeUrl}`, {
+        // Initial API call
+        let response = await axios.get(`${conn.instanceUrl}${relativeUrl}`, {
             headers: {
                 'Authorization': `Bearer ${conn.accessToken}`,
                 'Content-Type': 'application/json'
             }
         });
-        console.log('\n=== REST API Response (JSON) ===');
-        console.log(JSON.stringify(response.data, null, 2));
+
+        let allData = [];
+        let responseData = response.data;
+
+        // Find the first array field in the response (e.g., recipes, sobjects, records)
+        const getRecordsArray = (data) => {
+            for (const key in data) {
+                if (Array.isArray(data[key])) {
+                    return { key, records: data[key] };
+                }
+            }
+            return { key: null, records: [] };
+        };
+
+        // Check if the response has pagination with nextPageUrl (or nextRecordsUrl for query endpoints)
+        let { key: recordsKey, records } = getRecordsArray(responseData);
+        if ((responseData.nextPageUrl || (responseData.nextRecordsUrl && !responseData.done)) && recordsKey) {
+            allData = records || [];
+
+            // Fetch additional pages
+            while (responseData.nextPageUrl || (responseData.nextRecordsUrl && !responseData.done)) {
+                const nextUrl = responseData.nextPageUrl || responseData.nextRecordsUrl;
+                console.log(chalk.yellow(`Fetching more records... (${allData.length}${responseData.totalSize ? ` of ${responseData.totalSize}` : ''} retrieved)`));
+                response = await axios.get(`${conn.instanceUrl}${nextUrl}`, {
+                    headers: {
+                        'Authorization': `Bearer ${conn.accessToken}`,
+                        'Content-Type': 'application/json'
+                    }
+                });
+                responseData = response.data;
+                records = responseData[recordsKey] || [];
+                allData = allData.concat(records);
+            }
+        } else {
+            // If no pagination, use the response data as-is
+            allData = Array.isArray(responseData) ? responseData : records.length > 0 ? records : [responseData];
+        }
+
+        console.log(chalk.blue('\n=== REST API Response (JSON) ==='));
+        console.log(JSON.stringify(allData, null, 2));
 
         const outputFormat = await promptUser('Export to CSV? (yes/no): ');
-        if (outputFormat.toLowerCase() === 'yes' && Array.isArray(response.data)) {
+        if (outputFormat.toLowerCase() === 'yes' && Array.isArray(allData)) {
             const csvWriter = createObjectCsvWriter({
                 path: 'rest_api_results.csv',
-                header: Object.keys(response.data[0] || {}).map(key => ({ id: key, title: key }))
+                header: Object.keys(allData[0] || {})
+                    .filter(key => key !== 'attributes')
+                    .map(key => ({ id: key, title: key }))
             });
-            await csvWriter.writeRecords(response.data);
-            console.log('Results exported to rest_api_results.csv');
+            await csvWriter.writeRecords(allData);
+            console.log(chalk.magenta('Results exported to rest_api_results.csv'));
         }
     } catch (error) {
-        console.error('Error calling REST API:', error.message);
+        console.error(chalk.red('Error calling REST API:', error.message));
     }
 }
 
+// Function to get user ID from username
+async function getUserIdFromUsername(conn, username) {
+    try {
+        const result = await conn.query(`SELECT Id FROM User WHERE Username = '${username}' LIMIT 1`);
+        if (result.records.length === 0) {
+            throw new Error(`User with username "${username}" not found.`);
+        }
+        return result.records[0].Id;
+    } catch (error) {
+        console.error(chalk.red('Error retrieving user ID:', error.message));
+        throw error;
+    }
+}
+
+
 async function trackChanges(conn) {
-    console.log('Note: Change tracking only works in sandboxes and scratch orgs, not in production orgs.');
+    console.log(chalk.yellow('Note: Change tracking only works in sandboxes and scratch orgs, not in production orgs.'));
     const sinceDate = await promptUser('Enter the date to track changes since (YYYY-MM-DD, e.g., 2025-04-01), or press Enter for all changes: ');
-    
-    // Construct the Tooling API query
-    let query = 'SELECT MemberType, MemberName, RevisionNum, LastModifiedDate, LastModifiedById FROM SourceMember';
+    const lastModifiedByUsername = await promptUser('Enter the username of the last modified by user (e.g., user@example.org), or press Enter to skip: ');
+
+    let query = `
+        SELECT
+            Id,
+            LastModifiedBy.Name,
+            MemberIdOrName,
+            MemberType,
+            MemberName,
+            RevisionNum,
+            RevisionCounter,
+            IsNameObsolete,
+            LastModifiedById,
+            IsNewMember,
+            ChangedBy
+        FROM SourceMember
+    `;
+    const conditions = [];
+
     if (sinceDate) {
-        query += ` WHERE LastModifiedDate >= ${sinceDate}T00:00:00Z`;
+        conditions.push(`LastModifiedDate >= ${sinceDate}T00:00:00Z`);
+    }
+
+    let lastModifiedById = null;
+    if (lastModifiedByUsername) {
+        try {
+            lastModifiedById = await getUserIdFromUsername(conn, lastModifiedByUsername);
+            conditions.push(`LastModifiedById = '${lastModifiedById}'`);
+        } catch (error) {
+            return;
+        }
+    }
+
+    if (conditions.length > 0) {
+        query += ' WHERE ' + conditions.join(' AND ');
     }
     query += ' ORDER BY LastModifiedDate DESC';
 
     try {
-        const result = await conn.tooling.query(query);
-        const records = result.records || [];
-        if (records.length === 0) {
-            console.log('No changes found.');
+        // Initial query
+        let result = await conn.tooling.query(query);
+        let allRecords = result.records || [];
+
+        // Handle pagination if more records exist
+        while (!result.done && result.nextRecordsUrl) {
+            console.log(chalk.yellow(`Fetching more records... (${allRecords.length} of ${result.totalSize} retrieved)`));
+            result = await conn.requestGet(result.nextRecordsUrl);
+            allRecords = allRecords.concat(result.records || []);
+        }
+
+        if (allRecords.length === 0) {
+            console.log(chalk.yellow('No changes found matching the criteria.'));
             return;
         }
 
-        // Display results in JSON
-        console.log('\n=== Tracked Changes (JSON) ===');
-        console.log(JSON.stringify(records, null, 2));
+        console.log(chalk.blue('\n=== Tracked Changes (JSON) ==='));
+        console.log(JSON.stringify(allRecords, null, 2));
 
-        // Export to CSV if requested
         const outputFormat = await promptUser('Export to CSV? (yes/no): ');
         if (outputFormat.toLowerCase() === 'yes') {
             const csvWriter = createObjectCsvWriter({
                 path: 'tracked_changes.csv',
                 header: [
+                    { id: 'Id', title: 'Id' },
+                    { id: 'LastModifiedBy.Name', title: 'Last Modified By Name' },
+                    { id: 'MemberIdOrName', title: 'Member Id or Name' },
                     { id: 'MemberType', title: 'Member Type' },
                     { id: 'MemberName', title: 'Member Name' },
                     { id: 'RevisionNum', title: 'Revision Number' },
-                    { id: 'LastModifiedDate', title: 'Last Modified Date' },
-                    { id: 'LastModifiedById', title: 'Last Modified By' }
+                    { id: 'RevisionCounter', title: 'Revision Counter' },
+                    { id: 'IsNameObsolete', title: 'Is Name Obsolete' },
+                    { id: 'LastModifiedById', title: 'Last Modified By Id' },
+                    { id: 'IsNewMember', title: 'Is New Member' },
+                    { id: 'ChangedBy', title: 'Changed By' }
                 ]
             });
-            await csvWriter.writeRecords(records);
-            console.log('Results exported to tracked_changes.csv');
+
+            const flattenedRecords = allRecords.map(record => ({
+                ...record,
+                'LastModifiedBy.Name': record.LastModifiedBy ? record.LastModifiedBy.Name : 'N/A'
+            }));
+
+            await csvWriter.writeRecords(flattenedRecords);
+            console.log(chalk.magenta('Results exported to tracked_changes.csv'));
         }
 
-        // Generate package.xml if requested
         const generatePackage = await promptUser('Generate package.xml for these changes? (yes/no): ');
         if (generatePackage.toLowerCase() === 'yes') {
-            const packageXml = generatePackageXml(records);
+            const packageXml = generatePackageXml(allRecords);
             await fs.writeFile('package.xml', packageXml);
-            console.log('package.xml generated successfully.');
+            console.log(chalk.green('package.xml generated successfully.'));
             console.log('Run the following command in your SFDX project to retrieve the changes:');
-            console.log(`sf project retrieve start -x package.xml -o ${await promptUser('Enter your SFDX username: ')}`);
+            console.log(chalk.cyan(`sf project retrieve start -x package.xml -o ${await promptUser('Enter your SFDX username: ')}`));
         }
     } catch (error) {
-        console.error('Error tracking changes:', error.message);
+        console.error(chalk.red('Error tracking changes:', error.message));
     }
 }
 
-// Function to generate package.xml from SourceMember records
 function generatePackageXml(records) {
-    // Group records by MemberType
     const typesMap = new Map();
     records.forEach(record => {
         if (!typesMap.has(record.MemberType)) {
@@ -165,7 +289,6 @@ function generatePackageXml(records) {
         typesMap.get(record.MemberType).push(record.MemberName);
     });
 
-    // Generate package.xml content
     let xml = '<?xml version="1.0" encoding="UTF-8"?>\n';
     xml += '<Package xmlns="http://soap.sforce.com/2006/04/metadata">\n';
 
@@ -185,12 +308,12 @@ function generatePackageXml(records) {
 
 async function mainMenu(conn) {
     while (true) {
-        console.log('\n=== SF Utils - Salesforce SOQL Query and Run Apex ===');
-        console.log('1. Run SOQL Query');
-        console.log('2. Run Anonymous Apex');
-        console.log('3. Call Custom REST API URL');
-        console.log('4. Track Changes (SourceMember)');
-        console.log('5. Exit');
+        console.log(chalk.cyan.bold('\n=== SF Utils - Salesforce SOQL Query and Run Apex ==='));
+        console.log(chalk.yellow('1. Run SOQL Query'));
+        console.log(chalk.yellow('2. Run Anonymous Apex'));
+        console.log(chalk.yellow('3. Call Custom REST API URL'));
+        console.log(chalk.yellow('4. Track Changes (SourceMember)'));
+        console.log(chalk.yellow('5. Exit'));
         
         const choice = await promptUser('Select an option (1-5): ');
 
@@ -208,11 +331,11 @@ async function mainMenu(conn) {
                 await trackChanges(conn);
                 break;
             case '5':
-                console.log('Exiting...');
+                console.log(chalk.green('Exiting...'));
                 rl.close();
                 return;
             default:
-                console.log('Invalid option. Please try again.');
+                console.log(chalk.red('Invalid option. Please try again.'));
         }
     }
 }
@@ -222,10 +345,10 @@ async function mainMenu(conn) {
         const username = await promptUser('Enter your Salesforce username: ');
         const { accessToken, instanceUrl } = await getSalesforceCredentials(username);
         const conn = await initializeConnection(accessToken, instanceUrl);
-        console.log('Successfully connected to Salesforce!');
+        console.log(chalk.green('Successfully connected to Salesforce!'));
         await mainMenu(conn);
     } catch (error) {
-        console.error('Failed to initialize:', error.message);
+        console.error(chalk.red('Failed to initialize:', error.message));
         rl.close();
     }
 })();
