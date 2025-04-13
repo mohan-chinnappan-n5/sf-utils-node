@@ -1,3 +1,22 @@
+//----------------------------
+// index.js
+// author: Mohan Chinnappan
+//----------------------------
+
+// This script is a command-line utility for Salesforce developers to run SOQL queries, execute anonymous Apex code, call custom REST APIs, and track changes in Salesforce.
+// It uses the jsforce library to connect to Salesforce and perform these operations.
+// It also uses the csv-writer library to export query results to CSV files.
+// The script prompts the user for input and provides options to execute different tasks.
+// It requires the following dependencies:
+// - jsforce: For Salesforce API interactions
+// - csv-writer: For exporting query results to CSV files
+// - axios: For making HTTP requests to custom REST APIs
+// - readline: For reading user input from the command line
+// - util: For promisifying the exec function
+// - child_process: For executing shell commands
+// - fs: For file system operations
+// - chalk: For colored console output
+
 const { exec } = require('child_process');
 const util = require('util');
 const jsforce = require('jsforce');
@@ -7,13 +26,21 @@ const axios = require('axios');
 const fs = require('fs').promises;
 const chalk = require('chalk');
 
+// Constants
+const LAST_USERNAME_FILE = 'last_username.txt';
+
+
+
+// Promisify exec to use async/await
 const execPromise = util.promisify(exec);
 
+// Create a readline interface for user input
 const rl = readline.createInterface({
     input: process.stdin,
     output: process.stdout
 });
 
+// Function to prompt user for input
 function promptUser(question) {
     return new Promise((resolve) => {
         rl.question(chalk.green(question), (answer) => {
@@ -45,7 +72,12 @@ async function initializeConnection(accessToken, instanceUrl) {
 }
 
 // Function to run SOQL query
-
+// This function prompts the user for a SOQL query, executes it, and handles pagination if necessary.
+// It also offers the option to export the results to a CSV file.
+// The function uses the jsforce library to interact with Salesforce and axios for HTTP requests.
+// It also uses the csv-writer library to export the results to a CSV file.
+// The function handles errors that may occur during the execution of the query and provides feedback to the user.
+// It also handles the case where the user may want to export the results to a CSV file.
 
 async function runSOQLQuery(conn) {
     const query = await promptUser('Enter your SOQL query (e.g., SELECT Id, Name FROM Account LIMIT 10): ');
@@ -96,67 +128,127 @@ async function runApex(conn) {
 }
 
 // Function to call a custom REST API URL
+// This function prompts the user for the HTTP method (GET, POST, PATCH, DELETE), the REST API URL, and optionally a JSON payload file.
+// It then makes the HTTP request using axios and handles the response.
+// The function also offers the option to export the response to a JSON file and, for GET requests, to a CSV file.
+// It handles errors that may occur during the HTTP request and provides feedback to the user.
+// It also handles the case where the user may want to export the response to a JSON file or a CSV file.
+
 async function callRestApi(conn) {
+    console.log(chalk.yellow('Select HTTP method:'));
+    console.log(chalk.yellow('1. GET'));
+    console.log(chalk.yellow('2. POST'));
+    console.log(chalk.yellow('3. PATCH'));
+    console.log(chalk.yellow('4. DELETE'));
+    const methodChoice = await promptUser('Enter the method number (1-4): ');
+
+    let method;
+    switch (methodChoice) {
+        case '1':
+            method = 'GET';
+            break;
+        case '2':
+            method = 'POST';
+            break;
+        case '3':
+            method = 'PATCH';
+            break;
+        case '4':
+            method = 'DELETE';
+            break;
+        default:
+            console.log(chalk.red('Invalid method selected. Defaulting to GET.'));
+            method = 'GET';
+    }
+
     const relativeUrl = await promptUser('Enter the REST API URL (e.g., /services/data/v59.0/sobjects/Account/describe): ');
+
+    let payload = null;
+    if (method === 'POST' || method === 'PATCH') {
+        const filePath = await promptUser('Enter the path to the JSON payload file (e.g., payload.json): ');
+        try {
+            const fileContent = await fs.readFile(filePath, 'utf8');
+            payload = JSON.parse(fileContent);
+            console.log(chalk.blue('Payload loaded successfully:'));
+            console.log(JSON.stringify(payload, null, 2));
+        } catch (error) {
+            console.error(chalk.red('Error reading or parsing JSON file:', error.message));
+            return;
+        }
+    }
+
     try {
-        // Initial API call
-        let response = await axios.get(`${conn.instanceUrl}${relativeUrl}`, {
-            headers: {
-                'Authorization': `Bearer ${conn.accessToken}`,
-                'Content-Type': 'application/json'
-            }
-        });
+        const headers = {
+            'Authorization': `Bearer ${conn.accessToken}`,
+            'Content-Type': 'application/json'
+        };
+
+        let response;
+        if (method === 'GET') {
+            response = await axios.get(`${conn.instanceUrl}${relativeUrl}`, { headers });
+        } else if (method === 'POST') {
+            response = await axios.post(`${conn.instanceUrl}${relativeUrl}`, payload, { headers });
+        } else if (method === 'PATCH') {
+            response = await axios.patch(`${conn.instanceUrl}${relativeUrl}`, payload, { headers });
+        } else if (method === 'DELETE') {
+            response = await axios.delete(`${conn.instanceUrl}${relativeUrl}`, { headers });
+        }
 
         let allData = [];
         let responseData = response.data;
 
-        // Find the first array field in the response (e.g., recipes, sobjects, records)
-        const getRecordsArray = (data) => {
-            for (const key in data) {
-                if (Array.isArray(data[key])) {
-                    return { key, records: data[key] };
-                }
-            }
-            return { key: null, records: [] };
-        };
-
-        // Check if the response has pagination with nextPageUrl (or nextRecordsUrl for query endpoints)
-        let { key: recordsKey, records } = getRecordsArray(responseData);
-        if ((responseData.nextPageUrl || (responseData.nextRecordsUrl && !responseData.done)) && recordsKey) {
-            allData = records || [];
-
-            // Fetch additional pages
-            while (responseData.nextPageUrl || (responseData.nextRecordsUrl && !responseData.done)) {
-                const nextUrl = responseData.nextPageUrl || responseData.nextRecordsUrl;
-                console.log(chalk.yellow(`Fetching more records... (${allData.length}${responseData.totalSize ? ` of ${responseData.totalSize}` : ''} retrieved)`));
-                response = await axios.get(`${conn.instanceUrl}${nextUrl}`, {
-                    headers: {
-                        'Authorization': `Bearer ${conn.accessToken}`,
-                        'Content-Type': 'application/json'
+        if (method === 'GET') {
+            const getRecordsArray = (data) => {
+                for (const key in data) {
+                    if (Array.isArray(data[key])) {
+                        return { key, records: data[key] };
                     }
-                });
-                responseData = response.data;
-                records = responseData[recordsKey] || [];
-                allData = allData.concat(records);
+                }
+                return { key: null, records: [] };
+            };
+
+            let { key: recordsKey, records } = getRecordsArray(responseData);
+            if ((responseData.nextPageUrl || (responseData.nextRecordsUrl && !responseData.done)) && recordsKey) {
+                allData = records || [];
+
+                while (responseData.nextPageUrl || (responseData.nextRecordsUrl && !responseData.done)) {
+                    const nextUrl = responseData.nextPageUrl || responseData.nextRecordsUrl;
+                    console.log(chalk.yellow(`Fetching more records... (${allData.length}${responseData.totalSize ? ` of ${responseData.totalSize}` : ''} retrieved)`));
+                    response = await axios.get(`${conn.instanceUrl}${nextUrl}`, { headers });
+                    responseData = response.data;
+                    records = responseData[recordsKey] || [];
+                    allData = allData.concat(records);
+                }
+            } else {
+                allData = Array.isArray(responseData) ? responseData : records.length > 0 ? records : [responseData];
             }
         } else {
-            // If no pagination, use the response data as-is
-            allData = Array.isArray(responseData) ? responseData : records.length > 0 ? records : [responseData];
+            allData = responseData;
         }
 
         console.log(chalk.blue('\n=== REST API Response (JSON) ==='));
         console.log(JSON.stringify(allData, null, 2));
 
-        const outputFormat = await promptUser('Export to CSV? (yes/no): ');
-        if (outputFormat.toLowerCase() === 'yes' && Array.isArray(allData)) {
-            const csvWriter = createObjectCsvWriter({
-                path: 'rest_api_results.csv',
-                header: Object.keys(allData[0] || {})
-                    .filter(key => key !== 'attributes')
-                    .map(key => ({ id: key, title: key }))
-            });
-            await csvWriter.writeRecords(allData);
-            console.log(chalk.magenta('Results exported to rest_api_results.csv'));
+        // Offer JSON export for all methods
+        const exportToJson = await promptUser('Export response to JSON file? (yes/no): ');
+        if (exportToJson.toLowerCase() === 'yes') {
+            await fs.writeFile('rest_api_response.json', JSON.stringify(allData, null, 2));
+            console.log(chalk.magenta('Response exported to rest_api_response.json'));
+        }
+
+        // Offer CSV export only for GET requests that return a list of records
+        if (method === 'GET' && Array.isArray(allData)) {
+            const outputFormat = await promptUser('Export to CSV? (yes/no): ');
+            if (outputFormat.toLowerCase() === 'yes') {
+                const csvWriter = createObjectCsvWriter({
+                    path: 'rest_api_results.csv',
+                    header: Object.keys(allData[0] || {})
+                        .filter(key => key !== 'attributes')
+                        .map(key => ({ id: key, title: key }))
+                });
+                await csvWriter.writeRecords(allData);
+                console.log(chalk.magenta('Results exported to rest_api_results.csv'));
+            }
         }
     } catch (error) {
         console.error(chalk.red('Error calling REST API:', error.message));
@@ -164,6 +256,9 @@ async function callRestApi(conn) {
 }
 
 // Function to get user ID from username
+// This function retrieves the user ID based on the provided username.
+// It uses a SOQL query to fetch the user ID from the User object.
+// If the user is not found, it throws an error.
 async function getUserIdFromUsername(conn, username) {
     try {
         const result = await conn.query(`SELECT Id FROM User WHERE Username = '${username}' LIMIT 1`);
@@ -177,7 +272,12 @@ async function getUserIdFromUsername(conn, username) {
     }
 }
 
-
+// Function to track changes in SourceMember
+// This function allows the user to track changes in the SourceMember object.
+// It prompts the user for a date to track changes since and the username of the last modified by user.
+// It constructs a SOQL query based on the provided criteria and executes it.
+// The function handles pagination if more records exist and offers the option to export the results to a CSV file.
+// It also generates a package.xml file based on the tracked changes.
 async function trackChanges(conn) {
     console.log(chalk.yellow('Note: Change tracking only works in sandboxes and scratch orgs, not in production orgs.'));
     const sinceDate = await promptUser('Enter the date to track changes since (YYYY-MM-DD, e.g., 2025-04-01), or press Enter for all changes: ');
@@ -272,14 +372,19 @@ async function trackChanges(conn) {
             const packageXml = generatePackageXml(allRecords);
             await fs.writeFile('package.xml', packageXml);
             console.log(chalk.green('package.xml generated successfully.'));
-            console.log('Run the following command in your SFDX project to retrieve the changes:');
-            console.log(chalk.cyan(`sf project retrieve start -x package.xml -o ${await promptUser('Enter your SFDX username: ')}`));
+            //console.log('Run the following command in your SFDX project to retrieve the changes:');
+            //console.log(chalk.cyan(`sf project retrieve start -x package.xml -o ${await promptUser('Enter your SFDX username: ')}`));
         }
     } catch (error) {
         console.error(chalk.red('Error tracking changes:', error.message));
     }
 }
 
+// Function to generate package.xml based on tracked changes
+// This function takes the tracked changes records and generates a package.xml file.
+// It groups the records by MemberType and creates the appropriate XML structure.
+// The function returns the generated XML string.
+// The generated package.xml can be used for retrieving metadata from Salesforce using the SFDX CLI.
 function generatePackageXml(records) {
     const typesMap = new Map();
     records.forEach(record => {
@@ -306,6 +411,15 @@ function generatePackageXml(records) {
     return xml;
 }
 
+// Main menu function
+// This function presents the main menu to the user and handles their choices.
+// It uses a while loop to keep the menu active until the user chooses to exit.
+// The function calls the appropriate functions based on the user's choice.
+// It also handles invalid input and provides feedback to the user.
+// The function uses the chalk library to color the console output for better readability.
+// The main menu includes options to run SOQL queries, execute anonymous Apex code, call custom REST APIs, and track changes in SourceMember.
+// It also includes an option to exit the program.
+// The function uses async/await to handle asynchronous operations and ensure a smooth user experience.
 async function mainMenu(conn) {
     while (true) {
         console.log(chalk.cyan.bold('\n=== SF Utils - Salesforce SOQL Query and Run Apex ==='));
@@ -342,7 +456,25 @@ async function mainMenu(conn) {
 
 (async () => {
     try {
-        const username = await promptUser('Enter your Salesforce username: ');
+        // Read the last username, if it exists
+        let lastUsername = '';
+        try {
+            lastUsername = await fs.readFile(LAST_USERNAME_FILE, 'utf8');
+            lastUsername = lastUsername.trim();
+        } catch (error) {
+            // File doesn't exist or can't be read; proceed with empty default
+        }
+
+        // Prompt for username with last username as default
+        const defaultPrompt = lastUsername ? ` (default: ${lastUsername})` : '';
+        const username = await promptUser(`Enter your Salesforce username${defaultPrompt}: `) || lastUsername;
+        if (!username) {
+            throw new Error('Salesforce username is required.');
+        }
+
+        // Save the entered username for next time
+        await fs.writeFile(LAST_USERNAME_FILE, username);
+
         const { accessToken, instanceUrl } = await getSalesforceCredentials(username);
         const conn = await initializeConnection(accessToken, instanceUrl);
         console.log(chalk.green('Successfully connected to Salesforce!'));
