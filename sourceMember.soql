@@ -1,0 +1,12 @@
+SELECT
+                        Id,
+                        LastModifiedBy.Name,
+                        MemberIdOrName,        
+                        MemberType,
+                        MemberName,
+                        RevisionNum, RevisionCounter,
+                        IsNameObsolete,
+                        LastModifiedById,
+                        IsNewMember,
+                        ChangedBy                      
+                        FROM SourceMember 

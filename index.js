@@ -68,14 +68,83 @@ async function initializeConnection(accessToken, instanceUrl, apiVersion) {
 
 // Function to run SOQL query
 async function runSOQLQuery(conn) {
-    const query = await promptUser('Enter your SOQL query (e.g., SELECT Id, Name FROM Account LIMIT 10): ');
     try {
-        let result = await conn.query(query);
+        // Prompt for query source
+        console.log(chalk.yellow('Select query source:'));
+        console.log(chalk.yellow('1. Enter query interactively'));
+        console.log(chalk.yellow('2. Load query from .soql file'));
+        const querySourceChoice = await promptUser('Enter the source number (1-2): ');
+
+        let query;
+        if (querySourceChoice === '2') {
+            const filePath = await promptUser('Enter the path to the .soql file (e.g., query.soql): ');
+            try {
+                query = await fs.readFile(filePath, 'utf8');
+                query = query.trim();
+                if (!query) throw new Error('SOQL file is empty.');
+                console.log(chalk.blue('Loaded SOQL query:'), query);
+                // Allow user to modify the loaded query
+                const modifyQuery = await promptUser('Do you want to modify the loaded query? (yes/no): ');
+                if (modifyQuery.toLowerCase() === 'yes') {
+                    const newQuery = await promptUser('Enter the new SOQL query in single line: ');
+                    if (newQuery) {
+                        query = newQuery.trim();
+                        console.log(chalk.blue('Updated SOQL query:'), query);
+                    }
+                }
+            } catch (error) {
+                console.error(chalk.red('Error reading SOQL file:', error.message));
+                return;
+            }
+        } else if (querySourceChoice === '1') {
+            query = await promptUser('Enter your SOQL query (e.g., SELECT Id, Name FROM Account LIMIT 10): ');
+            if (!query) {
+                console.error(chalk.red('SOQL query cannot be empty.'));
+                return;
+            }
+        } else {
+            console.error(chalk.red('Invalid source selected. Please try again.'));
+            return;
+        }
+
+        // Prompt for API type
+        console.log(chalk.yellow('Select API to execute query:'));
+        console.log(chalk.yellow('1. Standard API'));
+        console.log(chalk.yellow('2. Tooling API'));
+        const apiChoice = await promptUser('Enter the API number (1-2): ');
+
+        let result;
+        if (apiChoice === '2') {
+            // Use Tooling API
+            try {
+                result = await conn.tooling.query(query);
+            } catch (error) {
+                console.error(chalk.red('Error executing Tooling API SOQL query:', error.message));
+                return;
+            }
+        } else if (apiChoice === '1') {
+            // Use Standard API
+            try {
+                result = await conn.query(query);
+            } catch (error) {
+                console.error(chalk.red('Error executing Standard API SOQL query:', error.message));
+                return;
+            }
+        } else {
+            console.error(chalk.red('Invalid API selected. Please try again.'));
+            return;
+        }
+
         let allRecords = result.records || [];
 
+        // Handle pagination
         while (!result.done && result.nextRecordsUrl) {
             console.log(chalk.yellow(`Fetching more records... (${allRecords.length} of ${result.totalSize} retrieved)`));
-            result = await conn.queryMore(result.nextRecordsUrl);
+            if (apiChoice === '2') {
+                result = await conn.tooling.queryMore(result.nextRecordsUrl);
+            } else {
+                result = await conn.queryMore(result.nextRecordsUrl);
+            }
             allRecords = allRecords.concat(result.records || []);
         }
 
@@ -84,6 +153,10 @@ async function runSOQLQuery(conn) {
 
         const outputFormat = await promptUser('Export to CSV? (yes/no): ');
         if (outputFormat.toLowerCase() === 'yes') {
+            if (allRecords.length === 0) {
+                console.log(chalk.yellow('No records to export.'));
+                return;
+            }
             const headers = Object.keys(allRecords[0] || {})
                 .filter(key => key !== 'attributes')
                 .map(key => ({ id: key, title: key }));
@@ -97,7 +170,7 @@ async function runSOQLQuery(conn) {
             console.log(chalk.magenta('Results exported to query_results.csv'));
         }
     } catch (error) {
-        console.error(chalk.red('Error executing SOQL query:', error.message));
+        console.error(chalk.red('Unexpected error in SOQL query:', error.message));
     }
 }
 
