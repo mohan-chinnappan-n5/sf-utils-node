@@ -46,7 +46,9 @@ async function getSalesforceCredentials(username) {
         const result = JSON.parse(stdout);
         const accessToken = result.result.accessToken;
         const instanceUrl = result.result.instanceUrl;
-        return { accessToken, instanceUrl };
+        const apiVersion = result.result.apiVersion || '60.0'; // Fallback to 60.0 if not found
+
+        return { accessToken, instanceUrl, apiVersion };
     } catch (error) {
         console.error(chalk.red('Error retrieving Salesforce credentials:', error.message));
         throw error;
@@ -54,11 +56,13 @@ async function getSalesforceCredentials(username) {
 }
 
 // Function to initialize jsforce connection
-async function initializeConnection(accessToken, instanceUrl) {
+async function initializeConnection(accessToken, instanceUrl, apiVersion) {
     const conn = new jsforce.Connection({
         instanceUrl: instanceUrl,
         accessToken: accessToken
     });
+    conn.apiVersion = apiVersion; // Store apiVersion on conn
+
     return conn;
 }
 
@@ -383,6 +387,7 @@ async function runBulkApiJob(conn) {
             return;
         }
 
+
         // Prompt for Salesforce object and operation
         const sObject = await promptUser('Enter the Salesforce object (e.g., Account, Contact): ');
 
@@ -445,9 +450,11 @@ async function runBulkApiJob(conn) {
 
         // Create Bulk API 2.0 job using REST API
         let jobInfo;
+        const apiVersion = conn.apiVersion || '69.0';
+
         try {
             console.log(chalk.yellow('Creating job using REST API...'));
-            jobInfo = await conn.requestPost('/services/data/v59.0/jobs/ingest', {
+            jobInfo = await conn.requestPost(`/services/data/v${apiVersion}/jobs/ingest`, {
                 object: sObject,
                 operation: operation,
                 externalIdFieldName: externalIdFieldName || undefined,
@@ -479,7 +486,7 @@ async function runBulkApiJob(conn) {
             console.log(chalk.yellow('Uploading CSV data using REST API...'));
             await conn.request({
                 method: 'PUT',
-                url: `/services/data/v59.0/jobs/ingest/${jobInfo.id}/batches`,
+                url: `/services/data/v${apiVersion}/jobs/ingest/${jobInfo.id}/batches`,
                 body: csvContent,
                 headers: {
                     'Content-Type': 'text/csv'
@@ -496,7 +503,7 @@ async function runBulkApiJob(conn) {
             console.log(chalk.yellow('Closing job using REST API...'));
             await conn.request({
                 method: 'PATCH',
-                url: `/services/data/v59.0/jobs/ingest/${jobInfo.id}`,
+                url: `/services/data/v${apiVersion}/jobs/ingest/${jobInfo.id}`,
                 body: JSON.stringify({ state: 'UploadComplete' }),
                 headers: {
                     'Content-Type': 'application/json'
@@ -512,7 +519,7 @@ async function runBulkApiJob(conn) {
         let jobStatus;
         try {
             console.log(chalk.yellow('Fetching initial job status...'));
-            jobStatus = await conn.requestGet(`/services/data/v59.0/jobs/ingest/${jobInfo.id}`);
+            jobStatus = await conn.requestGet(`/services/data/v${apiVersion}/jobs/ingest/${jobInfo.id}`);
         } catch (error) {
             console.error(chalk.red('Error retrieving job status:', error.message));
             return;
@@ -522,7 +529,7 @@ async function runBulkApiJob(conn) {
         while (jobStatus.state !== 'JobComplete' && jobStatus.state !== 'Failed' && jobStatus.state !== 'Aborted') {
             await new Promise(resolve => setTimeout(resolve, 5000)); // Wait 5 seconds
             try {
-                jobStatus = await conn.requestGet(`/services/data/v59.0/jobs/ingest/${jobInfo.id}`);
+                jobStatus = await conn.requestGet(`/services/data/v${apiVersion}/jobs/ingest/${jobInfo.id}`);
                 console.log(chalk.yellow(`Job Status: ${jobStatus.state}, Records Processed: ${jobStatus.numberRecordsProcessed}, Records Failed: ${jobStatus.numberRecordsFailed}`));
             } catch (error) {
                 console.error(chalk.red('Error checking job status:', error.message));
@@ -544,7 +551,7 @@ async function runBulkApiJob(conn) {
             // Fetch successful results
             try {
                 console.log(chalk.yellow('Fetching successful results...'));
-                const successfulResultsResponse = await conn.requestGet(`/services/data/v59.0/jobs/ingest/${jobInfo.id}/successfulResults`);
+                const successfulResultsResponse = await conn.requestGet(`/services/data/v${apiVersion}/jobs/ingest/${jobInfo.id}/successfulResults`);
                 const successfulResults = await new Promise((resolve, reject) => {
                     const records = [];
                     require('csv-parse')({ columns: true })
@@ -568,7 +575,7 @@ async function runBulkApiJob(conn) {
             // Fetch failed results
             try {
                 console.log(chalk.yellow('Fetching failed results...'));
-                const failedResultsResponse = await conn.requestGet(`/services/data/v59.0/jobs/ingest/${jobInfo.id}/failedResults`);
+                const failedResultsResponse = await conn.requestGet(`/services/data/v${apiVersion}/jobs/ingest/${jobInfo.id}/failedResults`);
                 const failedResults = await new Promise((resolve, reject) => {
                     const records = [];
                     require('csv-parse')({ columns: true })
@@ -651,8 +658,11 @@ async function mainMenu(conn) {
 
         await fs.writeFile(LAST_USERNAME_FILE, username);
 
-        const { accessToken, instanceUrl } = await getSalesforceCredentials(username);
-        const conn = await initializeConnection(accessToken, instanceUrl);
+        const { accessToken, instanceUrl, apiVersion } = await getSalesforceCredentials(username);
+        console.log(chalk.blue('Instance URL:', instanceUrl));
+        console.log(chalk.blue('API Version:', apiVersion));
+
+        const conn = await initializeConnection(accessToken, instanceUrl, apiVersion);
         console.log(chalk.green('Successfully connected to Salesforce!'));
         await mainMenu(conn);
     } catch (error) {
