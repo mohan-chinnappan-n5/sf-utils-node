@@ -65,7 +65,6 @@ async function initializeConnection(accessToken, instanceUrl, apiVersion) {
 
     return conn;
 }
-
 // Function to run SOQL query
 async function runSOQLQuery(conn) {
     try {
@@ -86,7 +85,7 @@ async function runSOQLQuery(conn) {
                 // Allow user to modify the loaded query
                 const modifyQuery = await promptUser('Do you want to modify the loaded query? (yes/no): ');
                 if (modifyQuery.toLowerCase() === 'yes') {
-                    const newQuery = await promptUser('Enter the new SOQL query in single line: ');
+                    const newQuery = await promptUser('Enter the new SOQL query: ');
                     if (newQuery) {
                         query = newQuery.trim();
                         console.log(chalk.blue('Updated SOQL query:'), query);
@@ -113,7 +112,51 @@ async function runSOQLQuery(conn) {
         console.log(chalk.yellow('2. Tooling API'));
         const apiChoice = await promptUser('Enter the API number (1-2): ');
 
+        // Prompt for Explain Plan if Standard API is selected
+        let runExplainPlan = false;
+        if (apiChoice === '1') {
+            const explainChoice = await promptUser('Run Explain Plan for this query? (yes/no): ');
+            if (explainChoice.toLowerCase() === 'yes') {
+                runExplainPlan = true;
+            }
+        } else if (apiChoice !== '2') {
+            console.error(chalk.red('Invalid API selected. Please try again.'));
+            return;
+        }
+
+        // Run Explain Plan if requested
+        if (runExplainPlan) {
+            try {
+                console.log(chalk.yellow('Running Explain Plan...'));
+                const explainResult = await conn.requestGet(`/services/data/v${conn.apiVersion}/query/?explain=${encodeURIComponent(query)}`);
+                console.log(chalk.blue('\n=== Explain Plan Results ==='));
+                const plans = Array.isArray(explainResult.plans) ? explainResult.plans : [explainResult];
+                plans.forEach((plan, index) => {
+                    console.log(chalk.blue(`Plan ${index + 1}:`));
+                    console.log(JSON.stringify({
+                        Cardinality: plan.cardinality || 'N/A',
+                        Fields: plan.fields || [],
+                        LeadingOperationType: plan.leadingOperationType || 'N/A',
+                        RelativeCost: plan.relativeCost || 'N/A',
+                        SObject: plan.sobjectType || 'N/A',
+                        Notes: plan.notes || []
+                    }, null, 2));
+                });
+            } catch (error) {
+                console.error(chalk.red('Error running Explain Plan:', error.message));
+                // Continue to query execution even if Explain Plan fails
+            }
+        }
+
+        // Prompt to proceed with query execution
+        const proceed = await promptUser('Proceed with query execution? (yes/no): ');
+        if (proceed.toLowerCase() !== 'yes') {
+            console.log(chalk.yellow('Query execution skipped.'));
+            return;
+        }
+
         let result;
+        let queryStartTime = performance.now(); // Start timing
         if (apiChoice === '2') {
             // Use Tooling API
             try {
@@ -130,9 +173,6 @@ async function runSOQLQuery(conn) {
                 console.error(chalk.red('Error executing Standard API SOQL query:', error.message));
                 return;
             }
-        } else {
-            console.error(chalk.red('Invalid API selected. Please try again.'));
-            return;
         }
 
         let allRecords = result.records || [];
@@ -147,9 +187,12 @@ async function runSOQLQuery(conn) {
             }
             allRecords = allRecords.concat(result.records || []);
         }
+        let queryEndTime = performance.now(); // End timing
+        let executionTime = (queryEndTime - queryStartTime).toFixed(2);
 
         console.log(chalk.blue('\n=== Query Results (JSON) ==='));
         console.log(JSON.stringify(allRecords, null, 2));
+        console.log(chalk.green(`Query execution time: ${executionTime} ms`));
 
         const outputFormat = await promptUser('Export to CSV? (yes/no): ');
         if (outputFormat.toLowerCase() === 'yes') {
@@ -159,20 +202,35 @@ async function runSOQLQuery(conn) {
             }
             const headers = Object.keys(allRecords[0] || {})
                 .filter(key => key !== 'attributes')
-                .map(key => ({ id: key, title: key }));
+                .map(key => ({ id: key, title: key.replace(/([A-Z])/g, ' $1').trim() }));
+
+            const flattenedRecords = allRecords.map(record => {
+                const flatRecord = {};
+                Object.keys(record).forEach(key => {
+                    if (key !== 'attributes') {
+                        if (typeof record[key] === 'object' && record[key] && 'Name' in record[key]) {
+                            flatRecord[key] = record[key].Name || 'N/A';
+                        } else {
+                            flatRecord[key] = record[key];
+                        }
+                    }
+                });
+                return flatRecord;
+            });
 
             const csvWriter = createObjectCsvWriter({
                 path: 'query_results.csv',
                 header: headers
             });
 
-            await csvWriter.writeRecords(allRecords);
+            await csvWriter.writeRecords(flattenedRecords);
             console.log(chalk.magenta('Results exported to query_results.csv'));
         }
     } catch (error) {
         console.error(chalk.red('Unexpected error in SOQL query:', error.message));
     }
 }
+
 
 // Function to run anonymous Apex code
 async function runApex(conn) {
