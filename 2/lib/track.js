@@ -77,6 +77,7 @@ async function trackChanges(conn, sinceDate, lastModifiedByUsername) {
         await csvWriter.writeRecords(flattenedRecords);
 
         const packageXml = generatePackageXml(allRecords);
+        console.log('DEBUG: Generated package.xml:', packageXml);
         await require('fs').promises.writeFile('package.xml', packageXml);
     }
 

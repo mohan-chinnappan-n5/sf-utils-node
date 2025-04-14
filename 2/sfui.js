@@ -1,4 +1,5 @@
-// index.js
+#!/usr/bin/env node
+//sfui .js
 // author: Mohan Chinnappan
 //----------------------------
 // This script handles the UI for a Salesforce utility, prompting users for input and displaying results.
